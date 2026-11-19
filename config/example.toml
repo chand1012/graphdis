@@ -1,0 +1,129 @@
+# Complete schema example. Replace endpoint and authentication values before use.
+version = 1
+
+[wifi]
+ssid = "your-network"
+password = "replace-me"
+authentication = "wpa2_personal"
+
+[display]
+rotation_secs = 30
+
+[theme]
+mode = "dark"
+
+[theme.dark]
+accent = "#6E9FFF"
+chart_colors = ["#73BF69", "#F2CC0C", "#5794F2", "#FF9830", "#F2495C", "#B877D9"]
+
+[theme.light]
+chart_colors = ["#37872D", "#967302", "#1F60C4", "#C15C17", "#C4162A", "#8F3BB8"]
+
+[sources.exporter]
+type = "metrics"
+url = "http://192.168.1.10:9100/metrics"
+poll_interval_secs = 15
+timeout_secs = 10
+max_response_bytes = 65536
+
+[sources.exporter.headers]
+X-Tenant = "example"
+
+[sources.prometheus]
+type = "prometheus"
+url = "http://192.168.1.20:9090"
+poll_interval_secs = 15
+
+[sources.prometheus.auth]
+type = "bearer"
+token = "replace-with-your-token"
+
+[[screens]]
+title = "Overview"
+rows = 1
+columns = 2
+
+[[screens.widgets]]
+type = "graph"
+# Optional legend rename: legend = "Requests {{method}} {{path}}"
+title = "HTTP requests"
+source = "exporter"
+metric = "http_requests_total"
+labels = { method = "GET" }
+row = 0
+column = 0
+history_points = 120
+max_series = 3
+window_secs = 1800
+
+[[screens.widgets]]
+type = "gauge"
+title = "CPU usage"
+source = "prometheus"
+query = "100 * (1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])))"
+row = 0
+column = 1
+style = "dial"
+unit = "%"
+scale = "none"
+min = 0
+max = 100
+
+[[screens.widgets.thresholds]]
+value = 70
+role = "warning"
+
+[[screens.widgets.thresholds]]
+value = 90
+role = "error"
+dark = "#FF5286"
+light = "#CF0E5B"
+
+[[screens]]
+title = "Memory"
+rows = 2
+columns = 2
+
+[[screens.widgets]]
+type = "number"
+title = "Available memory"
+source = "exporter"
+metric = "node_memory_MemAvailable_bytes"
+unit = "B"
+scale = "binary"
+
+[[screens.widgets]]
+type = "number"
+title = "Total memory"
+source = "prometheus"
+query = "node_memory_MemTotal_bytes{instance=\"server:9100\"}"
+column = 1
+unit = "B"
+scale = "binary"
+precision = 3
+
+[[screens.widgets]]
+type = "gauge"
+title = "Free memory"
+source = "exporter"
+metric = "node_memory_MemAvailable_bytes"
+row = 1
+column_span = 2
+style = "bar"
+unit = "B"
+scale = "binary"
+
+[[screens.widgets.thresholds]]
+value = 0
+role = "error"
+
+[[screens.widgets.thresholds]]
+value = 1073741824
+role = "warning"
+
+[[screens.widgets.thresholds]]
+value = 2147483648
+role = "success"
+
+# Optional touch mapping. Hold the panel at startup to calibrate, then paste the
+# [touch] table printed by the serial monitor here. Coefficients are board-specific.

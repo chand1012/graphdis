@@ -1,0 +1,101 @@
+[package]
+edition      = "2024"
+name         = "graphdis"
+rust-version = "1.95"
+version      = "0.1.0"
+
+[[bin]]
+name = "graphdis"
+path = "./src/bin/main.rs"
+required-features = ["firmware"]
+
+[[example]]
+name = "display_preview"
+required-features = ["display"]
+
+[[example]]
+name = "render_metrics"
+required-features = ["metrics"]
+
+[features]
+default = ["firmware"]
+firmware = [
+  "dep:esp-hal", "dep:esp-rtos", "dep:esp-bootloader-esp-idf",
+  "dep:esp-alloc", "dep:esp-radio", "dep:esp-println",
+  "dep:embassy-executor", "dep:embassy-net", "dep:embassy-time",
+  "dep:embassy-sync", "dep:static_cell",
+  "http", "dep:critical-section",
+  "dep:esp-storage", "display", "metrics", "dep:mipidsi", "dep:embedded-hal-bus",
+  "dep:embedded-sdmmc", "dep:embedded-hal",
+]
+metrics = ["display", "http", "dep:serde_json", "heapless/serde"]
+display = ["dep:embedded-graphics", "dep:heapless", "dep:humanize_proper", "dep:libm"]
+http = ["dep:reqwless", "dep:embedded-io", "dep:embedded-io-async", "dep:embedded-nal-async", "dep:heapless", "dep:base64", "dep:httparse"]
+
+[dependencies]
+esp-storage = { version = "0.10.0", features = ["esp32"], optional = true }
+embedded-sdmmc = { version = "0.10.0", default-features = false, optional = true }
+embedded-hal = { version = "1.0.0", optional = true }
+serde_json = { version = "1.0.149", default-features = false, features = ["alloc"], optional = true }
+serde = { version = "1.0.228", default-features = false, features = ["alloc", "derive"] }
+toml = { version = "0.9.12", default-features = false, features = ["parse", "serde"] }
+nourl = "0.1.5"
+toml_parser = { version = "1.1.5", default-features = false }
+libm = { version = "0.2.16", optional = true }
+humanize_proper = { version = "0.1.2", optional = true }
+embedded-nal-async = { version = "0.9.0", optional = true }
+heapless = { version = "0.9.3", optional = true }
+base64 = { version = "0.21.7", default-features = false, optional = true }
+httparse = { version = "1.10.1", default-features = false, optional = true }
+esp-println = { version = "0.18.0", features = ["esp32"], optional = true }
+esp-hal = { version = "~1.2.2", features = ["esp32", "unstable"], optional = true }
+
+esp-rtos = { version = "0.4.0", optional = true, features = [
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32",
+] }
+
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32"], optional = true }
+
+embassy-net = { version = "0.9.1", optional = true, features = [
+  "dhcpv4",
+  "dns",
+  "medium-ethernet",
+  "tcp",
+  "udp",
+] }
+embedded-io = { version = "0.7.1", optional = true }
+embedded-io-async = { version = "0.7.0", optional = true }
+esp-alloc = { version = "0.11.0", features = ["esp32"], optional = true }
+# for more networking protocol support see https://crates.io/crates/edge-net
+embassy-executor = { version = "0.10.0", optional = true, features = [] }
+embassy-time = { version = "0.5.0", optional = true }
+embassy-sync = { version = "0.8.0", optional = true }
+esp-radio = { version = "1.0.0-beta.1", optional = true, features = [
+  "esp-alloc",
+  "esp32",
+  "unstable",
+  "wifi",
+] }
+
+critical-section = { version = "1.2.0", optional = true }
+static_cell = { version = "2.1.1", optional = true }
+mipidsi = { version = "0.10.0", optional = true }
+embedded-graphics = { version = "0.8.2", optional = true }
+embedded-hal-bus = { version = "0.3.0", optional = true }
+reqwless = { version = "0.14.0", default-features = false, optional = true }
+
+
+# For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+[profile.dev]
+# The default debug profile is too slow and too big for resource-constrained devices.
+# Always build with some optimizations enabled.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1     # LLVM can perform better optimizations using a single thread
+debug         = 2     # prefer slower builds but better debugging experience
+lto           = 'fat'
+opt-level     = 's'

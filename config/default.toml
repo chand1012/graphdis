@@ -1,0 +1,16 @@
+# Minimal valid dashboard fallback. With no [wifi] section, networking remains disabled.
+# Copy this file to config.local.toml, uncomment the section, and supply credentials.
+# Build with GRAPHDIS_CONFIG=config.local.toml cargo build --release.
+version = 1
+
+# [wifi]
+# ssid = "your-network"
+# password = "your-password"
+# authentication = "wpa2_personal"
+
+# For an intentionally open network, set authentication = "open" and omit password.
+
+[[screens]]
+title = "Configure Graphdis"
+rows = 1
+columns = 1
