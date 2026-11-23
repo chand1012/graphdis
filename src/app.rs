@@ -16,9 +16,13 @@ use crate::{
     metrics::{MetricSink, Model, POOL_POINTS, ParserBuffers, QueryMode, Stage, empty_points},
     network::{Network, TcpResources},
     sources::http::{ContentKind, HttpBuffers, Request},
+    timing::{Ms, Span},
 };
 use calibration::{calibrate, wait_release};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    cell::Cell,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use embassy_executor::Spawner;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Instant, Timer};
@@ -40,6 +44,47 @@ fn now() -> u64 {
     Instant::now().as_millis().saturating_add(86_400_000)
 }
 
+/// Measures storage reads so configuration parse time can be reported separately.
+struct TimedReader<'a, R> {
+    inner: &'a mut R,
+    read: &'a Cell<esp_hal::time::Duration>,
+}
+impl<R: ConfigReader> ConfigReader for TimedReader<'_, R> {
+    fn read(&mut self, filename: &str, buffer: &mut [u8]) -> Result<usize, config::ReadError> {
+        let start = esp_hal::time::Instant::now();
+        let result = self.inner.read(filename, buffer);
+        self.read.set(self.read.get() + start.elapsed());
+        result
+    }
+}
+
+/// Load configuration, logging storage and parse/validation time separately.
+fn load_timed(
+    reader: &mut impl ConfigReader,
+    scratch: &mut [u8],
+    attempt: u32,
+) -> Result<config::LoadedConfig, config::ConfigError> {
+    let read = Cell::new(esp_hal::time::Duration::ZERO);
+    let span = Span::start("app: config load");
+    let result = config::load(
+        &mut TimedReader {
+            inner: reader,
+            read: &read,
+        },
+        scratch,
+        COMPILED_CONFIG,
+    );
+    let total = span.done_with(format_args!("attempt {}, ok={}", attempt, result.is_ok()));
+    crate::timing!(
+        "app: config storage {} + parse/validate {}",
+        Ms(read.get()),
+        Ms(total
+            .checked_sub(read.get())
+            .unwrap_or(esp_hal::time::Duration::ZERO))
+    );
+    result
+}
+
 /// Boot selection and UI loop. A present invalid card never selects the fallback.
 pub async fn run(
     spawner: Spawner,
@@ -49,7 +94,9 @@ pub async fn run(
     wifi: esp_hal::peripherals::WIFI<'static>,
     flash: esp_hal::peripherals::FLASH<'static>,
 ) -> ! {
+    let run_span = Span::start("app: run");
     let defaults = Palette::defaults(ThemeMode::Dark);
+    let span = Span::quiet("app: loading screen draw");
     let drawn = controls::message(
         &mut lcd.lcd,
         &defaults,
@@ -58,10 +105,13 @@ pub async fn run(
     )
     .is_ok();
     lcd.set_backlight(drawn);
+    span.done_with(format_args!("backlight={}", drawn));
     let scratch = SCRATCH.init_with(|| [0; 8193]);
+    let mut attempt = 0u32;
     let config = loop {
+        attempt += 1;
         let result = match storage.as_mut() {
-            Ok(reader) => config::load(reader, scratch, COMPILED_CONFIG),
+            Ok(reader) => load_timed(reader, scratch, attempt),
             Err(_) => {
                 // A failed SPI initialization is an I/O failure, not an absent card.
                 struct Failed;
@@ -70,7 +120,7 @@ pub async fn run(
                         Err(config::ReadError::Io)
                     }
                 }
-                config::load(&mut Failed, scratch, COMPILED_CONFIG)
+                load_timed(&mut Failed, scratch, attempt)
             }
         };
         match result {
@@ -92,6 +142,7 @@ pub async fn run(
                     "Configuration error",
                     "Fix TOML, then touch to retry",
                 );
+                crate::timing!("app: waiting for touch to retry config (user wait)");
                 // Retry needs a complete contact/release cycle, avoiding a held
                 // finger or noise repeatedly mounting the card.
                 wait_release(&mut touch, Duration::from_secs(30)).await;
@@ -105,11 +156,13 @@ pub async fn run(
             }
         }
     };
+    let span = Span::start("app: calibration selection");
     let mut touch_store = crate::board::calibration::CalibrationStore::new(flash);
     let mut saved = touch_store.load(storage.as_mut().ok()).ok().flatten();
     if saved.is_none()
         && let Some(coefficients) = config.touch_calibration()
     {
+        crate::timing!("app: persisting calibration from TOML");
         let configured = Calibration(coefficients);
         match touch_store.save(configured, storage.as_mut().ok()) {
             Ok(location) => esp_println::println!("Configured calibration saved: {:?}", location),
@@ -119,7 +172,9 @@ pub async fn run(
         }
         saved = Some(configured);
     }
+    span.done_with(format_args!("saved={}", saved.is_some()));
     let mut calibration = if let Some(saved) = saved {
+        let prompt = Span::start("app: recalibration prompt window (fixed 1.5s)");
         let _ = controls::message(
             &mut lcd.lcd,
             config.theme().active(),
@@ -127,9 +182,12 @@ pub async fn run(
             "Tap now to redo touch setup",
         );
         let mut selected = saved;
+        let mut tapped = false;
         for _ in 0..60 {
             Timer::after(Duration::from_millis(25)).await;
             if touch.sample().is_some() {
+                tapped = true;
+                crate::timing!("app: prompt tapped; interactive calibration (user wait)");
                 if let Some(c) = calibrate(
                     &mut lcd,
                     &mut touch,
@@ -144,8 +202,10 @@ pub async fn run(
                 break;
             }
         }
+        prompt.done_with(format_args!("tapped={}", tapped));
         selected
     } else {
+        crate::timing!("app: no saved calibration; interactive calibration (user wait)");
         loop {
             if let Some(c) = calibrate(
                 &mut lcd,
@@ -160,9 +220,13 @@ pub async fn run(
             }
         }
     };
+    crate::timing!("app: calibration ready");
+    let span = Span::start("app: model + staging init");
     let config = CONFIG.init(config);
     *MODEL.lock().await = Some(Model::new(config, ACTIVE.init_with(empty_points)));
     let stage = Stage::new(config, STAGING.init_with(empty_points));
+    span.done_with(format_args!("heap free {}", esp_alloc::HEAP.free()));
+    let span = Span::start("app: network start");
     let network =
         config
             .wifi()
@@ -173,6 +237,11 @@ pub async fn run(
                     None
                 }
             });
+    span.done_with(format_args!(
+        "started={} heap free {}",
+        network.is_some(),
+        esp_alloc::HEAP.free()
+    ));
     let all = if config.reservations().len() == 16 {
         u16::MAX
     } else {
@@ -184,9 +253,11 @@ pub async fn run(
         {
             spawner.spawn(task);
         }
+        let span = Span::quiet("app: collector buffers init");
         let parser = PARSER.init_with(ParserBuffers::new);
         let http = HTTP.init_with(HttpBuffers::new);
         let tcp = TCP.init_with(TcpResources::new);
+        span.done();
         match collect(config, network, stage, parser, http, tcp) {
             Ok(task) => spawner.spawn(task),
             Err(_) => {
@@ -205,6 +276,11 @@ pub async fn run(
     esp_println::println!("Startup free heap: {} bytes", esp_alloc::HEAP.free());
     static RENDERER: StaticCell<display::Renderer> = StaticCell::new();
     let renderer = RENDERER.init_with(display::Renderer::new);
+    run_span.done_with(format_args!("entering UI loop"));
+    // Log the first few frames, the first frame showing collected data, and any
+    // later frame slow enough to matter.
+    let mut frames = 0u32;
+    let mut data_frame_logged = false;
     let mut nav = Navigation::new(config.screens().len(), config.rotation_secs(), now());
     let mut menu = false;
     let mut captured = None;
@@ -266,6 +342,10 @@ pub async fn run(
                         }
                         Some(Action::Calibrate) => {
                             renderer.invalidate();
+                            // The user may have inserted a card since boot.
+                            if let Ok(card) = storage.as_mut() {
+                                card.reprobe();
+                            }
                             if let Some(c) = calibrate(
                                 &mut lcd,
                                 &mut touch,
@@ -281,6 +361,9 @@ pub async fn run(
                         }
                         Some(Action::Reload) => {
                             renderer.invalidate();
+                            if let Ok(card) = storage.as_mut() {
+                                card.reprobe();
+                            }
                             let _ = controls::message(
                                 &mut lcd.lcd,
                                 config.theme().active(),
@@ -333,6 +416,9 @@ pub async fn run(
             model.now_ms = time;
             dirty |= model.revision != last_revision || time.saturating_sub(last_frame) >= 1000;
             if dirty {
+                let frame = Span::quiet("ui: frame");
+                let yields = Cell::new(0u32);
+                let yield_time = Cell::new(esp_hal::time::Duration::ZERO);
                 let result = if menu {
                     renderer.menu(
                         &mut lcd.lcd,
@@ -345,13 +431,35 @@ pub async fn run(
                         },
                     )
                 } else {
+                    let yields = &yields;
+                    let yield_time = &yield_time;
                     renderer
-                        .draw_cooperative(&mut lcd.lcd, config, &nav, model, time, || {
-                            Timer::after(Duration::from_millis(1))
+                        .draw_cooperative(&mut lcd.lcd, config, &nav, model, time, || async move {
+                            let start = esp_hal::time::Instant::now();
+                            Timer::after(Duration::from_millis(1)).await;
+                            yields.set(yields.get() + 1);
+                            yield_time.set(yield_time.get() + start.elapsed());
                         })
                         .await
                 };
+                let tiles = result.as_ref().ok().map(|stats| stats.tiles_written);
                 lcd.set_backlight(result.is_ok());
+                frames = frames.saturating_add(1);
+                let elapsed = frame.elapsed();
+                let first_data = !data_frame_logged && model.revision != 0 && !menu;
+                if frames <= 5 || first_data || elapsed.as_millis() >= 100 {
+                    crate::timing!(
+                        "ui: frame {} {}{} tiles={:?} yields={} in {} rev={}",
+                        frames,
+                        Ms(elapsed),
+                        if first_data { " FIRST DATA" } else { "" },
+                        tiles,
+                        yields.get(),
+                        Ms(yield_time.get()),
+                        model.revision
+                    );
+                }
+                data_frame_logged |= first_data;
                 if result.is_err() {
                     renderer.invalidate();
                     esp_println::println!("Display frame failed");
@@ -373,7 +481,10 @@ async fn collect(
     http: &'static mut HttpBuffers,
     tcp: &'static TcpResources,
 ) {
+    crate::timing!("collect: task started");
     let client = network.http_client(tcp);
+    let mut first_commit = false;
+    let mut waiting = Some(Span::quiet("collect: waiting for network"));
     let mut due = [0u64; 24];
     let mut delays = [1u32; 24];
     let mut clocks = [None::<(u64, u64)>; 8];
@@ -394,7 +505,11 @@ async fn collect(
             Timer::after(Duration::from_millis(250)).await;
             continue;
         }
+        if let Some(span) = waiting.take() {
+            span.done();
+        }
         if offline {
+            crate::timing!("collect: network back; refetching all");
             due.fill(0);
             offline = false;
         }
@@ -416,6 +531,7 @@ async fn collect(
                     QueryMode::Instant { group },
                     time,
                 );
+                let span = Span::quiet("collect: fetch");
                 let result = client
                     .fetch(
                         source,
@@ -427,6 +543,12 @@ async fn collect(
                         &mut sink,
                     )
                     .await;
+                span.done_with(format_args!(
+                    "source {} time() ok={} bytes={:?}",
+                    name,
+                    result.is_ok(),
+                    result.as_ref().ok().map(|s| s.body_bytes)
+                ));
                 if result.is_ok()
                     && let Some(unix) = stage.server_ms()
                 {
@@ -487,8 +609,22 @@ async fn collect(
                     }
                 };
 
+                let kind = match request {
+                    Request::Metrics => "metrics",
+                    Request::Instant { .. } => "instant",
+                    Request::Range { .. } => "range",
+                };
                 let mut sink = MetricSink::new(config, &mut stage, parser, mask, mode, time);
+                let span = Span::quiet("collect: fetch");
                 let result = client.fetch(source, request, http, &mut sink).await;
+                span.done_with(format_args!(
+                    "source {} {} group {} ok={} bytes={:?}",
+                    name,
+                    kind,
+                    group,
+                    result.is_ok(),
+                    result.as_ref().ok().map(|s| s.body_bytes)
+                ));
                 let success = result.as_ref().is_ok_and(|s| {
                     if direct {
                         matches!(
@@ -501,8 +637,14 @@ async fn collect(
                 });
                 let finished = now();
                 if success {
+                    let span = Span::quiet("collect: commit");
                     if let Some(model) = MODEL.lock().await.as_mut() {
                         model.commit(&stage, finished);
+                    }
+                    span.done();
+                    if !first_commit {
+                        first_commit = true;
+                        crate::timing!("collect: FIRST DATA committed");
                     }
                     delays[key] = 1;
                     // Keep the polling cadence independent of request duration.
@@ -535,6 +677,7 @@ async fn collect(
 #[embassy_executor::task]
 async fn log_network(mut status: crate::network::StatusReceiver) {
     loop {
-        esp_println::println!("Network: {:?}", status.changed().await);
+        let status = status.changed().await;
+        crate::timing!("Network: {:?}", status);
     }
 }

@@ -14,6 +14,8 @@ use esp_hal::timer::timg::TimerGroup;
 use graphdis::{
     board::{storage::Storage, touch::Touch},
     display::board::BoardDisplay,
+    timing,
+    timing::Span,
 };
 
 #[panic_handler]
@@ -39,6 +41,8 @@ async fn main(spawner: Spawner) -> ! {
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+    // The monotonic counter starts inside esp_hal::init; bootloader time is excluded.
+    timing!("boot: esp_hal::init done, CPU clock max");
 
     // The following pins are used to bootstrap the chip. They are available
     // for use, but check the datasheet of the module for more information on them.
@@ -60,18 +64,24 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 98768);
     // Keep extra headroom for validation while radio and active metadata live.
     esp_alloc::heap_allocator!(size: 32768);
+    timing!("boot: heap ready, {} bytes free", esp_alloc::HEAP.free());
 
+    let span = Span::start("boot: esp-rtos start");
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+    span.done();
 
-    let display = match BoardDisplay::new(
+    let span = Span::start("boot: display init (SPI, ST7789, clear)");
+    let display = BoardDisplay::new(
         peripherals.SPI2,
         peripherals.GPIO14,
         peripherals.GPIO13,
         peripherals.GPIO15,
         peripherals.GPIO2,
         peripherals.GPIO21,
-    ) {
+    );
+    span.done_with(format_args!("ok={}", display.is_ok()));
+    let display = match display {
         Ok(display) => display,
         Err(error) => {
             esp_println::println!("Display initialization failed: {:?}", error);
@@ -80,6 +90,7 @@ async fn main(spawner: Spawner) -> ! {
             }
         }
     };
+    let span = Span::start("boot: MicroSD SPI init");
     let storage = Storage::new(
         peripherals.SPI3,
         peripherals.GPIO18,
@@ -87,6 +98,8 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO23,
         peripherals.GPIO5,
     );
+    span.done_with(format_args!("ok={}", storage.is_ok()));
+    let span = Span::quiet("boot: touch GPIO init");
     let touch = Touch::new(
         peripherals.GPIO25,
         peripherals.GPIO32,
@@ -94,6 +107,8 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO33,
         peripherals.GPIO36,
     );
+    span.done();
+    timing!("boot: hardware ready; entering app::run");
     graphdis::app::run(
         spawner,
         display,

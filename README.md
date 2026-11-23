@@ -302,6 +302,10 @@ cargo clippy --locked --all-features --workspace -- -D warnings
 cargo build --release --locked
 ```
 
+### Startup timing logs
+
+The firmware prints `[T <uptime>]` lines on the serial monitor for each boot stage, MicroSD access, Wi-Fi association and DHCP, DNS and TCP connect, each source fetch, and the first few frames. A span prints `done in <duration>`. Uptime starts inside `esp_hal::init`, so bootloader time is not included. Use these lines to find slow stages before changing startup code. Serial output is synchronous, so each line adds a few milliseconds to the spans around it.
+
 ### Preview screens on your computer
 
 Render synthetic data through the real widget renderer:

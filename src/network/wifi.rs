@@ -8,6 +8,7 @@ use super::{NetworkStatus, RetryReason, STATUS, StartError};
 use crate::{
     config::{Authentication, WifiConfig},
     retry::Backoff,
+    timing::{Ms, Span},
 };
 
 pub(super) fn station_config(config: &WifiConfig) -> Result<StationConfig, StartError> {
@@ -42,15 +43,30 @@ pub(super) async fn connection_task(
 ) -> ! {
     let status = STATUS.sender();
     let mut backoff = Backoff::new();
+    let mut attempt = 0u32;
     loop {
+        attempt = attempt.wrapping_add(1);
         status.send(NetworkStatus::Connecting);
+        let total = Span::quiet("wifi: attempt total");
+        crate::timing!("wifi: attempt {} associate (scan+auth) start", attempt);
+        let associate = Span::quiet("wifi: associate");
         let reason = match with_timeout(Duration::from_secs(20), controller.connect_async()).await {
             Ok(Ok(_)) => {
+                associate.done();
                 status.send(NetworkStatus::WaitingForAddress);
+                let dhcp = Span::start("wifi: DHCP");
                 // Link loss during DHCP is also bounded by this deadline.
-                match with_timeout(Duration::from_secs(30), stack.wait_config_up()).await {
+                let dhcp_result =
+                    with_timeout(Duration::from_secs(30), stack.wait_config_up()).await;
+                dhcp.done_with(format_args!("ok={}", dhcp_result.is_ok()));
+                match dhcp_result {
                     Ok(()) if controller.is_connected() && stack.is_link_up() => {
                         if let Some(config) = stack.config_v4() {
+                            crate::timing!(
+                                "wifi: online after attempt {}, attempt took {}",
+                                attempt,
+                                Ms(total.elapsed())
+                            );
                             backoff.reset();
                             let mut address = config.address.address().octets();
                             status.send(NetworkStatus::Online { address });
@@ -78,6 +94,7 @@ pub(super) async fn connection_task(
                 }
             }
             Ok(Err(error)) => {
+                associate.done_with(format_args!("failed"));
                 // DisconnectedInfo also contains SSID/BSSID. Log only the
                 // reason, never the full connection error or configuration.
                 match error {
@@ -93,8 +110,12 @@ pub(super) async fn connection_task(
                 }
                 RetryReason::ConnectionFailed
             }
-            Err(_) => RetryReason::ConnectionTimeout,
+            Err(_) => {
+                associate.done_with(format_args!("timed out"));
+                RetryReason::ConnectionTimeout
+            }
         };
+        total.done_with(format_args!("attempt {} ended: {:?}", attempt, reason));
         // A canceled connect future can leave a driver-side attempt running.
         // Explicitly abort it before retrying; teardown must also have a deadline.
         let _ = with_timeout(Duration::from_secs(5), controller.disconnect_async()).await;

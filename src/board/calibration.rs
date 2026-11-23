@@ -4,6 +4,7 @@ use crate::{
     board::storage::Storage,
     config::ReadError,
     display::touch::{Calibration, newest},
+    timing::Span,
 };
 use esp_hal::peripherals::FLASH;
 use esp_storage::FlashStorage;
@@ -31,6 +32,7 @@ pub struct CalibrationStore {
 }
 impl CalibrationStore {
     pub fn new(flash: FLASH<'static>) -> Self {
+        let span = Span::quiet("calibration: partition table scan");
         let mut flash = FlashStorage::new(flash);
         let mut present = false;
         let mut overlap = false;
@@ -55,6 +57,7 @@ impl CalibrationStore {
                 present = true;
             }
         }
+        span.done_with(format_args!("partition={}", present && !overlap));
         Self {
             flash,
             present: present && !overlap,
@@ -76,10 +79,13 @@ impl CalibrationStore {
         Ok(records)
     }
     pub fn load(&mut self, mut sd: Option<&mut Storage>) -> Result<Option<Calibration>, SaveError> {
+        let total = Span::start("calibration: load");
+        let span = Span::quiet("calibration: flash records");
         let flash = self
             .records()
             .ok()
             .and_then(|r| newest(r).and_then(|i| r[i]));
+        span.done_with(format_args!("found={}", flash.is_some()));
         let card = sd
             .as_deref_mut()
             .and_then(|s| match s.calibration_records() {
@@ -93,6 +99,12 @@ impl CalibrationStore {
         // Equal generations prefer the card; otherwise choose the newest copy.
         let choices = [flash, card];
         let selected = newest(choices).and_then(|i| choices[i]);
+        crate::timing!(
+            "calibration: flash={} card={} selected={}",
+            flash.is_some(),
+            card.is_some(),
+            selected.is_some()
+        );
         if let Some((generation, calibration)) = selected {
             self.observe(generation);
             // Adopt existing calibrations automatically. Matching copies do not
@@ -114,6 +126,7 @@ impl CalibrationStore {
                 esp_println::println!("Flash calibration backup unavailable: {:?}", error);
             }
         }
+        total.done();
         Ok(selected.map(|(_, c)| c))
     }
     fn observe(&mut self, generation: u32) {
@@ -166,6 +179,12 @@ impl CalibrationStore {
         }
     }
     fn save_flash(&mut self, c: Calibration, generation: u32) -> Result<(), SaveError> {
+        let span = Span::start("calibration: flash erase+write");
+        let result = self.save_flash_inner(c, generation);
+        span.done_with(format_args!("ok={}", result.is_ok()));
+        result
+    }
+    fn save_flash_inner(&mut self, c: Calibration, generation: u32) -> Result<(), SaveError> {
         let records = self.records()?;
         let active = newest(records);
         let slot = active.map_or(0, |i| 1 - i);

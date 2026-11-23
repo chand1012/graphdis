@@ -13,6 +13,9 @@ pub mod sources;
 mod retry;
 
 #[cfg(feature = "firmware")]
+pub mod timing;
+
+#[cfg(feature = "firmware")]
 pub mod network;
 
 #[cfg(feature = "display")]

@@ -1,7 +1,7 @@
 //! CYD / Elegoo ESPTouch-2.8: ST7789 on SPI2, shared EN reset.
 //! Panel setup matches the working `cyd-test` firmware for ESP32-2432S028R.
 //! Write-only SPI leaves GPIO12 (a boot strap) untouched. Touch uses another bus.
-use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
+use crate::timing::Span;
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use esp_hal::{
     Blocking,
@@ -31,12 +31,12 @@ static TRANSFER: StaticCell<[u8; 640]> = StaticCell::new();
 pub enum InitError {
     Spi,
     Display,
-    Clear,
     AlreadyStarted,
 }
 
 /// Own the backlight alongside the LCD. The backlight stays off until the first
-/// complete frame is drawn; initialization failures leave it off.
+/// complete frame is drawn; initialization failures leave it off. The panel is
+/// not cleared here: the caller's first screen paints every pixel while dark.
 pub struct BoardDisplay {
     pub lcd: Lcd,
     backlight: Output<'static>,
@@ -62,13 +62,14 @@ impl BoardDisplay {
             .try_init([0; 640])
             .ok_or(InitError::AlreadyStarted)?;
         let interface = SpiInterface::new(spi, dc, buffer);
-        let mut lcd = Builder::new(ST7789, interface)
+        let span = Span::quiet("display: ST7789 init sequence");
+        let lcd = Builder::new(ST7789, interface)
             .color_order(ColorOrder::Bgr)
             .invert_colors(ColorInversion::Normal)
             .orientation(Orientation::new().rotate(Rotation::Deg90).flip_horizontal())
             .init(&mut Delay::new())
             .map_err(|_| InitError::Display)?;
-        lcd.clear(Rgb565::BLACK).map_err(|_| InitError::Clear)?;
+        span.done();
         Ok(Self { lcd, backlight })
     }
     pub fn set_backlight(&mut self, on: bool) {

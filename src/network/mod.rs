@@ -20,7 +20,7 @@ use esp_hal::{peripherals::WIFI, rng::Rng};
 use esp_radio::wifi::{Interface, WifiController};
 use static_cell::StaticCell;
 
-use crate::config::WifiConfig;
+use crate::{config::WifiConfig, timing::Span};
 
 /// Four sockets: one DHCP, one DNS, and at most two application TCP sockets.
 pub const SOCKET_COUNT: usize = 4;
@@ -112,12 +112,15 @@ impl Network {
         config: &WifiConfig,
     ) -> Result<Self, StartError> {
         let station = wifi::station_config(config)?;
+        let span = Span::start("net: radio/controller init");
         let controller = WifiController::new(
             peripheral,
             esp_radio::wifi::ControllerConfig::default()
                 .with_initial_config(esp_radio::wifi::Config::Station(station)),
         )
         .map_err(|_| StartError::RadioInitialization)?;
+        span.done();
+        let span = Span::quiet("net: embassy-net stack + task spawn");
         let interface = Interface::try_station().ok_or(StartError::AlreadyStarted)?;
         let resources = RESOURCES
             .try_init_with(StackResources::new)
@@ -134,6 +137,7 @@ impl Network {
         spawner.spawn(
             wifi::connection_task(controller, stack).map_err(|_| StartError::TaskUnavailable)?,
         );
+        span.done();
         Ok(Self { stack })
     }
 

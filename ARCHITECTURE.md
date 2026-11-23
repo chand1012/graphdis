@@ -78,7 +78,9 @@ HAL features compatible with ESP32. Check the generator parameters in
   400 kHz; calibration uses separate, writable short-named files.
   A missing card/file selects the compiled fallback. Other read or validation
   failures show a retry screen. A CMD0 timeout means absent/unresponsive because
-  this board exposes no card-detect contact.
+  this board exposes no card-detect contact. The adapter gives up after a few
+  CMD0 retries (about 1.5 s) and remembers an absent card for the rest of the
+  boot. Only the menu's Reload and Calibrate actions probe it again.
 - `src/network/` owns Wi-Fi reconnect, DHCP, DNS, and bounded TCP resources.
   `src/sources/http/` provides authenticated streaming HTTP transport and deadlines.
 - `src/metrics/` parses selected exposition samples and Prometheus scalar/vector/
